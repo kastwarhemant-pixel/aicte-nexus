@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+# Local database (generated at first run)
+data/*.db
+data/*.db-journal
+data/*.sqlite
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+# Streamlit secrets (never commit)
+.streamlit/secrets.toml
