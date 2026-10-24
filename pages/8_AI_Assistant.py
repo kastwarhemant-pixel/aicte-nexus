@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
 import pandas as pd
 import streamlit as st
 
+import auth
 import database as db
 import intelligence as intel
 import ui
+
+user = auth.require()
 
 
 # ---------------------------------------------------------
@@ -85,7 +89,14 @@ GROQ_API_KEY = get_groq_key()
 GROQ_MODEL = get_groq_model()
 
 if GROQ_API_KEY:
-    st.success("Groq AI is configured. The assistant can use the Llama model.")
+    st.toggle("Allow external AI phrasing (Groq)", key="nexus_allow_external_ai", value=False,
+              help="Off by default. When on, only a redacted summary leaves this server: officer names, "
+                   "emails, phone numbers and ID numbers are removed first.")
+    if st.session_state.get("nexus_allow_external_ai"):
+        st.info("External AI is ON. Sent: your question and a compact result preview, with people-identifying "
+                "columns dropped and contact patterns masked. Never sent: the database, credentials, or other users' data.")
+    else:
+        st.success("Privacy mode: all answers are produced locally. Nothing leaves this server.")
 else:
     st.warning(
         "Groq API key is not configured. The assistant is running in "
@@ -134,6 +145,60 @@ if missing:
 
 
 # ---------------------------------------------------------
+# PRIVACY: redaction before anything leaves the server
+# ---------------------------------------------------------
+
+_REDACTIONS = [
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "[email]"),
+    (re.compile(r"(?<!\d)(?:\+?91[\s-]?)?[6-9]\d{9}(?!\d)"), "[phone]"),
+    (re.compile(r"(?<!\d)\d{4}\s?\d{4}\s?\d{4}(?!\d)"), "[id-number]"),
+    (re.compile(r"\b[A-Z]{5}\d{4}[A-Z]\b"), "[pan]"),
+]
+_DROP_COLUMNS = {"assigned_officer", "requested_by", "submitted_by", "contact_email", "reviewed_by"}
+
+
+def redact(text):
+    out = str(text)
+    for pattern, token in _REDACTIONS:
+        out = pattern.sub(token, out)
+    return out
+
+
+def redact_frame(frame):
+    """Remove people-identifying columns and mask contact patterns in the remaining text."""
+    if frame is None or frame.empty:
+        return []
+    keep = frame[[c for c in frame.columns if c not in _DROP_COLUMNS]].head(10).fillna("").astype(str)
+    return [{k: redact(v) for k, v in row.items()} for row in keep.to_dict("records")]
+
+
+def complaint_summary(cid):
+    """Extractive, database-grounded summary of one complaint plus relevant similar cases."""
+    c = db.get_complaint(cid)
+    if not c:
+        return f"No complaint **{cid}** was found in your scope.", pd.DataFrame()
+    timeline = db.get_timeline(cid)
+    sim = intel.similar_cases(cid, top=5)
+    last = ""
+    if not timeline.empty:
+        t = timeline.iloc[0]
+        last = f" Latest event: **{t['action_type'].replace('_', ' ').lower()}** on {t['ts'][:10]}."
+    due = db.parse_date(c["due_date"])
+    left = (due - db.today()).days
+    timing = ("closed out" if c["status"] in db.TERMINAL_STATUSES
+              else f"**{-left} day(s) overdue**" if left < 0 else f"due in **{left} day(s)**")
+    text = (f"**{cid}** — {c['title']}. {c['institution_name']} ({c['bureau']}), category *{c['category']}*, "
+            f"priority **{c['priority']}**, status **{c['status']}**, {timing}. Assigned to {c['assigned_officer']}; "
+            f"reassigned {c['reassign_count']}x" + (f", reopened {c['reopen_count']}x" if c["reopen_count"] else "")
+            + f".{last}\n\n> {c['description'][:400]}")
+    if not sim.empty:
+        same = int(sim["same_institution"].sum())
+        text += (f"\n\n**Relevant cases:** {len(sim)} similar complaint(s) found"
+                 + (f", {same} at the same institution" if same else "") + ". Review them below; links are suggestions only.")
+    return text, sim.drop(columns=["same_institution"], errors="ignore")
+
+
+# ---------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------
 
@@ -173,6 +238,10 @@ def local_analysis(question):
     q = question.lower().strip()
     df = all_df.copy()
 
+    match = re.search(r"cmp-\d{4}-\d{4}", q)
+    if match:
+        return complaint_summary(match.group(0).upper())
+
     df["is_open"] = safe_bool_series(df["is_open"])
     df["is_overdue"] = safe_bool_series(df["is_overdue"])
 
@@ -186,6 +255,10 @@ def local_analysis(question):
         ].copy()
     else:
         resolved = df[~df["is_open"]].copy()
+
+    if "summar" in q and "overdue" in q and not overdue_cases.empty:
+        worst = overdue_cases.sort_values("days_overdue", ascending=False).iloc[0]["complaint_id"]
+        return complaint_summary(worst)
 
     # Overdue complaints
     if any(term in q for term in [
@@ -440,12 +513,8 @@ def ask_groq(question, verified_answer, result_df):
     No SQL is generated or executed. The API key is never shown.
     """
     context = {
-        "local_analysis": verified_answer,
-        "result_preview": (
-            result_df.head(10).fillna("").astype(str).to_dict("records")
-            if result_df is not None and not result_df.empty
-            else []
-        ),
+        "local_analysis": redact(verified_answer),
+        "result_preview": redact_frame(result_df),
         "dataset_summary": {
             "total_complaints": int(len(all_df)),
             "institutions": int(all_df["institution_name"].nunique()),
@@ -482,7 +551,7 @@ Use concise Markdown in your response.
             {
                 "role": "user",
                 "content": (
-                    f"Question: {question}\n\n"
+                    f"Question: {redact(question)}\n\n"
                     "Verified local context:\n"
                     + json.dumps(context, ensure_ascii=False)
                 ),
@@ -541,7 +610,7 @@ def process_question(question):
     final_answer = local_answer
     api_error = None
 
-    if GROQ_API_KEY:
+    if GROQ_API_KEY and st.session_state.get("nexus_allow_external_ai"):
         ai_answer, api_error = ask_groq(
             question,
             local_answer,
@@ -591,7 +660,8 @@ st.divider()
 
 st.markdown("### Ask NEXUS")
 st.caption(
-    "Select a prompt below or type a question in your own words."
+    "Select a prompt below, type a question, or paste a complaint ID (e.g. CMP-2026-0012) for a summary "
+    "with relevant similar cases. Answers cover only the complaints your role may see."
 )
 
 quick_questions = [
@@ -601,6 +671,7 @@ quick_questions = [
     "Show open critical cases",
     "Explain current risk flags",
     "How is resolution performance?",
+    "Summarise the most overdue complaint",
 ]
 
 prompt_columns = st.columns(3)
@@ -675,19 +746,15 @@ if history:
             result = item.get("result")
 
             if isinstance(result, pd.DataFrame) and not result.empty:
-                st.dataframe(
-                    result,
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f"nexus_result_{number}",
-                )
+                ui.show_table(result)
 
-                st.download_button(
+                ui.export_button(
                     "Download results as CSV",
-                    data=result.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"nexus_ai_results_{number}.csv",
-                    mime="text/csv",
+                    db.to_csv_bytes(result),
+                    f"nexus_ai_results_{number}.csv",
+                    "text/csv",
                     key=f"nexus_csv_{number}",
+                    what="NEXUS AI result table",
                 )
 else:
     st.info(
@@ -703,7 +770,8 @@ with st.expander("How NEXUS Copilot works"):
     st.markdown(
         """
         **When Groq is configured**
-        - The question and a compact verified analysis are sent to Groq.
+        - Only if you switch on external AI: the question and a compact verified analysis are sent to Groq,
+          after people-identifying columns are dropped and emails, phone and ID numbers are masked.
         - The Llama model explains the supplied results in natural language.
         - If the API fails, NEXUS falls back to its local analysis.
 

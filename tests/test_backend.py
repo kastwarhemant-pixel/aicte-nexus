@@ -82,8 +82,12 @@ check("status change audited with prev/new", len(a) == 1 and a.iloc[0].previous_
 ok, _ = db.update_status(cid, "Resolved", resolution_notes="Fixed after inspection")
 c1 = db.get_complaint(cid)
 check("resolve with notes sets resolved_date", ok and c1["resolved_date"] == str(db.today()) and c1["resolution_notes"])
+ok, msg = db.update_status(cid, "In Progress")
+check("direct move out of Resolved is refused (needs reopen workflow)", not ok and "reopen" in msg.lower())
+ok, _ = db.reopen_now(cid, "Fresh evidence submitted by the complainant")
+check("reopen clears resolved_date", ok and db.get_complaint(cid)["resolved_date"] is None
+      and db.get_complaint(cid)["status"] == "Under Review" and db.get_complaint(cid)["reopen_count"] == 1)
 ok, _ = db.update_status(cid, "In Progress")
-check("reopen clears resolved_date", ok and db.get_complaint(cid)["resolved_date"] is None)
 check("priority change + audit", db.change_priority(cid, "Critical", "escalated")[0]
       and len(db.list_audit(action_types=["PRIORITY_CHANGED"], entity_id=cid)) == 1)
 check("officer reassignment counted + audit", db.assign_officer(cid, "Priya Nair", "load")[0]

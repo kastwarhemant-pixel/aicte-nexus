@@ -2,8 +2,11 @@
 import plotly.express as px
 import streamlit as st
 
+import auth
 import database as db
 import ui
+
+user = auth.require()
 
 ui.page_header("Institution Directory",
                "Search institutions, review their complaint history across bureaus, and manage records.")
@@ -29,8 +32,8 @@ with tab_dir:
             "last_complaint_date": "Last complaint"})
         view["Data"] = view.pop("is_synthetic").map({1: "Synthetic", 0: "User-added"})
         ui.show_table(view)
-        st.download_button("Export institutions to CSV", db.to_csv_bytes(view), "aicte_nexus_institutions.csv",
-                           "text/csv", key="dir_export")
+        ui.export_button("Export institutions to CSV", db.to_csv_bytes(view), "aicte_nexus_institutions.csv",
+                         "text/csv", key="dir_export", what="Institution directory")
 
 with tab_detail:
     if inst_all.empty:
@@ -73,8 +76,9 @@ Approval ref: {ui.e(inst['approval_ref'])} · Contact: {ui.e(inst['contact_email
             st.markdown("#### Complete complaint history")
             hv = ui.complaint_table_df(hist)
             ui.show_table(hv)
-            st.download_button("Export this history to CSV", db.to_csv_bytes(hv),
-                               f"{sel}_complaint_history.csv", "text/csv", key="dir_hist_export")
+            ui.export_button("Export this history to CSV", db.to_csv_bytes(hv),
+                             f"{sel}_complaint_history.csv", "text/csv", key="dir_hist_export",
+                             what=f"Complaint history of {sel}")
         rel = db.list_relationships(institution_id=sel)
         if not rel.empty:
             st.markdown("#### Cross-bureau relationship suggestions")
@@ -85,26 +89,31 @@ Approval ref: {ui.e(inst['approval_ref'])} · Contact: {ui.e(inst['contact_email
 
 with tab_add:
     st.caption("New institutions are stored as user-added (non-synthetic) records.")
-    with st.form("add_inst_form", clear_on_submit=False):
-        a1, a2 = st.columns(2)
-        iid = a1.text_input("Institution ID *", placeholder="INS-NEW-001", max_chars=24)
-        name = a2.text_input("Institution name *", max_chars=200)
-        a3, a4, a5 = st.columns(3)
-        state = a3.selectbox("State *", db.STATES)
-        district = a4.text_input("District *", max_chars=80)
-        itype = a5.selectbox("Institution type *", db.INSTITUTION_TYPES)
-        a6, a7 = st.columns(2)
-        ref = a6.text_input("AICTE approval reference *", placeholder="AICTE/DEMO/2026/0001", max_chars=60)
-        email = a7.text_input("Contact email *", placeholder="registrar@example.edu", max_chars=120)
-        submitted = st.form_submit_button("Add institution", type="primary")
-    if submitted:
-        ok, msg = db.add_institution({"institution_id": iid, "name": name, "state": state, "district": district,
-                                      "institution_type": itype, "approval_ref": ref, "contact_email": email},
-                                     db.default_actor())
-        ui.result(ok, msg)
+    if not db.has_perm("institution.write", user):
+        ui.banner("Adding institutions is limited to Senior Officers and Admins.", "info")
+    else:
+        with st.form("add_inst_form", clear_on_submit=False):
+            a1, a2 = st.columns(2)
+            iid = a1.text_input("Institution ID *", placeholder="INS-NEW-001", max_chars=24)
+            name = a2.text_input("Institution name *", max_chars=200)
+            a3, a4, a5 = st.columns(3)
+            state = a3.selectbox("State *", db.STATES)
+            district = a4.text_input("District *", max_chars=80)
+            itype = a5.selectbox("Institution type *", db.INSTITUTION_TYPES)
+            a6, a7 = st.columns(2)
+            ref = a6.text_input("AICTE approval reference *", placeholder="AICTE/DEMO/2026/0001", max_chars=60)
+            email = a7.text_input("Contact email *", placeholder="registrar@example.edu", max_chars=120)
+            submitted = st.form_submit_button("Add institution", type="primary")
+        if submitted:
+            ok, msg = db.add_institution({"institution_id": iid, "name": name, "state": state, "district": district,
+                                          "institution_type": itype, "approval_ref": ref, "contact_email": email},
+                                         db.default_actor())
+            ui.result(ok, msg)
 
 with tab_edit:
-    if inst_all.empty:
+    if not db.has_perm("institution.write", user):
+        ui.banner("Editing institutions is limited to Senior Officers and Admins.", "info")
+    elif inst_all.empty:
         ui.empty_state("No institutions to edit.")
     else:
         names = dict(zip(inst_all["institution_id"], inst_all["name"]))

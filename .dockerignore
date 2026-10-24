@@ -1,0 +1,5 @@
+data/*.db*
+data/backups
+__pycache__
+.env
+tests

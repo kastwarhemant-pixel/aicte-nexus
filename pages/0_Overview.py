@@ -3,9 +3,12 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import auth
 import database as db
+import intelligence as intel
 import ui
 
+user = auth.require()
 all_df = db.list_complaints()
 settings = db.get_settings()
 pending = db.count_relationships("Pending")
@@ -33,9 +36,11 @@ st.markdown(f"""
   </div>
 </div>""", unsafe_allow_html=True)
 ui.show_flash()
+ui.alert_strip(intel.compute_alerts(all_df, settings, user["full_name"]))
 
-with st.expander("Guided demo: seven scenarios you can run from the interface"):
+with st.expander("Guided demo: scenarios you can run from the interface"):
     st.markdown("""
+0. **Sign in** with different demo accounts (Admin, Senior Officer, a Bureau Officer) to see role-based access; try the 🌙 Dark mode switch.
 1. **Institution Directory** → search an institution with complaints in several bureaus (e.g. *Satpura*, *Utkal*, *Narmada*).
 2. Open **Institution details** to see its complete complaint history across bureaus.
 3. **Cross-Bureau Intelligence** → open a High-confidence suggestion and read why the two complaints were matched.
@@ -45,7 +50,8 @@ with st.expander("Guided demo: seven scenarios you can run from the interface"):
 7. **Analytics & Reports** → apply filters and download the CSV exports.
 """)
 
-ui.banner("Filters apply to every KPI, chart and table below. All numbers are computed from the local SQLite database.")
+ui.banner("Filters apply to every KPI, chart and table below. All numbers are computed from the database"
+          + (f" and limited to your bureau ({ui.e(user['bureau'])})." if user['role'] == 'Bureau Officer' else "."))
 f = ui.global_filters("ov", all_df)
 df = db.list_complaints(f)
 if df.empty:

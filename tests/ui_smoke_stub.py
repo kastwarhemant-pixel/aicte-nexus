@@ -37,8 +37,9 @@ class FakeSt(types.ModuleType):
         super().__init__("streamlit")
         self.reset()
 
-    def reset(self):
-        self.session_state = SS(); self.inputs = {}; self.clicks = set()
+    def reset(self, keep_session=True):
+        old = self.__dict__.get("session_state")
+        self.session_state = SS(old if (keep_session and old) else {}); self.inputs = {}; self.clicks = set()
         self.errors, self.successes, self.dataframes, self.downloads, self.html = [], [], [], [], []
 
     def _in(self, label, key, default):
@@ -94,9 +95,23 @@ sys.modules["streamlit"] = st
 for mod in ("plotly", "plotly.express", "plotly.graph_objects"):
     sys.modules[mod] = MagicMock()
 
+import accounts as ac  # noqa: E402
+import auth  # noqa: E402
 import database as db  # noqa: E402
 import intelligence as intel  # noqa: E402
 import ui  # noqa: E402
+
+_real_show_table = ui.show_table
+ui.show_table = lambda df, **k: st.dataframes.append(df)   # capture tables for assertions
+
+
+def login_as(username):
+    ok, u, _ = ac.authenticate(username, ac.DEMO_PASSWORD)
+    assert ok, username
+    st.session_state["_session_token"] = ac.create_session(u["user_id"])
+    st.session_state["user"] = u
+    db.set_current_user(u)
+    return u
 
 PAGES = {n: os.path.join(ROOT, "pages", n) for n in sorted(os.listdir(os.path.join(ROOT, "pages"))) if n.endswith(".py")}
 PASS = []
@@ -119,11 +134,34 @@ def check(name, cond):
 
 db.init_db()
 ui.bootstrap()
-check("app.py runs", run(os.path.join(ROOT, "app.py")) is None)
+# --- signed out: every page refuses to render, app shows only the login screen
+db.set_current_user(None); st.reset(keep_session=False)
+check("signed-out app.py stops at the login screen", run(os.path.join(ROOT, "app.py")) == "stop")
+for n, p in PAGES.items():
+    st.reset(keep_session=False); db.set_current_user(None)
+    check(f"signed-out page refuses: {n}", run(p) == "stop")
+st.reset(keep_session=False); auth.login_screen()
+st.reset(keep_session=False); st.inputs = {"li_user": "admin", "li_pass": "wrong"}; st.clicks = {"Sign in"}
+auth.login_screen(); check("login screen shows an error for bad credentials", st.errors)
+st.reset(keep_session=False); st.inputs = {"li_user": "senior.anita", "li_pass": ac.DEMO_PASSWORD}; st.clicks = {"Sign in"}
+try:
+    auth.login_screen(); out = None
+except Rerun:
+    out = "rerun"
+check("login screen signs in (rerun)", out == "rerun" and st.session_state["user"]["role"] == "Senior Officer")
+
+# --- Senior Officer drives the original scenarios
+login_as("senior.anita")
+check("app.py runs signed in", run(os.path.join(ROOT, "app.py")) is None)
 for n, p in PAGES.items():
     st.reset()
     out = run(p)
-    check(f"page loads: {n}", out in (None, "stop") and not st.errors)
+    check(f"page loads (senior): {n}", out in (None, "stop") and not st.errors)
+for mode in ("light", "dark"):
+    st.session_state["theme"] = mode
+    ui.bootstrap()
+st.session_state["theme"] = "light"
+check("light and dark CSS both build", ui.build_css("light") != ui.build_css("dark"))
 st.reset()
 check("overview exports no unescaped script tags", all("<script" not in h.lower() for h in st.html))
 
@@ -187,14 +225,24 @@ check("audit page lists relationship reviews", len(st.dataframes[0]) >= 2)
 
 # Scenario 7: exports
 st.reset(); run(PAGES["5_Analytics_Reports.py"])
-check("analytics offers 5 non-empty CSV exports", len(st.downloads) == 5 and all(len(d[2]) > 20 for d in st.downloads))
-st.reset(); st.inputs = {"an_bureau": ["Finance Bureau"]}; run(PAGES["5_Analytics_Reports.py"])
+check("analytics offers 5 CSV exports and a PDF", sum(d[1].endswith(".csv") for d in st.downloads) == 5
+      and any(d[1].endswith(".pdf") and d[2][:4] == b"%PDF" for d in st.downloads) and all(len(d[2]) > 20 for d in st.downloads))
+st.reset(); st.inputs = {"an_bureau": ["Finance Bureau"]}; st.session_state["_x"] = 1; run(PAGES["5_Analytics_Reports.py"])
 all_rows = db.to_csv_bytes(db.list_complaints()).count(b"\n")
 fin_rows = [d for d in st.downloads if d[1] == "complaints.csv"][0][2].count(b"\n")
 check("analytics filters change the exported data", fin_rows < all_rows)
 st.reset(); st.inputs = {"ov_bureau": ["Finance Bureau"]}; run(PAGES["0_Overview.py"])
 check("overview filter bureau runs", not st.errors)
 
+# Senior officers cannot open Settings; Admin can
+st.reset(); check("senior officer is refused on Settings", run(PAGES["7_Settings.py"]) == "stop")
+login_as("admin")
+for n in ("7_Settings.py", "9_User_Management.py", "10_My_Account.py"):
+    st.reset(); out = run(PAGES[n]); check(f"admin page loads: {n}", out in (None, "stop") and not st.errors)
+st.reset(); st.inputs = {"um_sel": 2}; st.clicks = {"Reset password"}; run(PAGES["9_User_Management.py"])
+check("admin can issue a temporary password from the UI", any("Temporary password" in h for h in st.html))
+st.reset(); st.clicks = {"Create backup now"}
+check("backup button works (rerun)", run(PAGES["7_Settings.py"]) == "rerun" and db.list_backups())
 # Risk page + settings
 st.reset(); run(PAGES["4_Risk_Monitoring.py"]); check("risk export offered", any(d[1] == "aicte_nexus_risk_cases.csv" for d in st.downloads))
 st.reset(); st.inputs = {"set_inactivity_days": 30}; st.clicks = {"Save settings"}
@@ -209,4 +257,16 @@ check("reset button inert with wrong confirmation word", db.count_complaints() =
 st.reset(); st.inputs = {"reset_ack": True, "reset_word": "RESET"}; st.clicks = {"Reset demo data"}
 check("reset with confirmation runs (rerun)", run(PAGES["7_Settings.py"]) == "rerun")
 check("user-created data gone, demo data restored", db.get_complaint(new_id) is None and db.count_complaints() >= 60)
+# Bureau officer through the UI
+login_as("finance.suresh")
+st.reset(); run(PAGES["2_Complaint_Management.py"])
+check("bureau officer register shows only own bureau", st.dataframes and set(st.dataframes[0]["Bureau"]) == {"Finance Bureau"})
+st.reset(); check("bureau officer refused on Settings", run(PAGES["7_Settings.py"]) == "stop")
+st.reset(); check("bureau officer refused on User Management", run(PAGES["9_User_Management.py"]) == "stop")
+st.reset(); run(PAGES["0_Overview.py"]); check("bureau officer overview loads", not st.errors)
+st.reset(); run(PAGES["6_Audit_Trail.py"]); check("bureau officer audit page loads (scoped)", not st.errors)
+# themed table pagination
+st.reset(); import pandas as _pd
+_real_show_table(_pd.DataFrame({"a": range(60), "b": ["x<script>"] * 60}))
+check("themed table paginates and escapes HTML", any("nx-table" in h and "<script>" not in h for h in st.html))
 print(f"\nALL {len(PASS)} UI-STUB CHECKS PASSED")

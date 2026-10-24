@@ -6,10 +6,13 @@ in the same transaction as the change itself.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import os
 import random
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 
 import pandas as pd
@@ -40,13 +43,39 @@ SLA_DAYS = {"Critical": 7, "High": 14, "Medium": 30, "Low": 45}
 OFFICERS = ["Anita Deshmukh", "Rohit Verma", "Priya Nair", "Imran Qureshi", "Suresh Iyer",
             "Kavita Joshi", "Manoj Pillai", "Neha Banerjee", "Arvind Chauhan", "Lakshmi Reddy"]
 
+ROLES = ["Admin", "Senior Officer", "Bureau Officer"]
+_ALL = ("Admin", "Senior Officer", "Bureau Officer")
+_SENIOR = ("Admin", "Senior Officer")
+# permission -> (roles allowed, human description used in "not permitted" messages)
+PERMISSIONS = {
+    "complaint.create":         (_ALL, "register complaints"),
+    "complaint.update":         (_ALL, "update complaints"),
+    "complaint.close":          (_SENIOR, "close complaints (Resolved is available to bureau officers)"),
+    "complaint.reassign":       (_SENIOR, "reassign officers"),
+    "complaint.priority":       (_SENIOR, "change complaint priority"),
+    "complaint.due":            (_SENIOR, "change due dates"),
+    "complaint.reopen_request": (_ALL, "request a reopen"),
+    "complaint.reopen_decide":  (_SENIOR, "approve or reject reopen requests"),
+    "relationship.review":      (_SENIOR, "verify cross-bureau suggestions"),
+    "relationship.refresh":     (_SENIOR, "refresh cross-bureau suggestions"),
+    "institution.write":        (_SENIOR, "add or edit institutions"),
+    "settings.write":           (("Admin",), "change system settings"),
+    "users.manage":             (("Admin",), "manage users"),
+    "data.reset":               (("Admin",), "reset demo data"),
+    "backup.create":            (("Admin",), "create database backups"),
+    "audit.verify":             (_SENIOR, "verify audit-log integrity"),
+}
+
 DEFAULT_SETTINGS = {
+    "due_soon_days": "3",
     "overdue_grace_days": "0", "inactivity_days": "14", "awaiting_info_days": "10",
     "reassignment_threshold": "2", "match_min_score": "0.30", "match_medium_score": "0.45",
     "match_high_score": "0.65", "match_date_window_days": "90", "demo_user": "Demo Officer",
 }
 # key: (label, type, min, max, help)
 SETTING_META = {
+    "due_soon_days": ("Deadline alert window (days)", int, 1, 30,
+                      "Open cases due within this many days raise a deadline alert."),
     "overdue_grace_days": ("Overdue grace period (days)", int, 0, 30,
                            "Days past the due date tolerated before a case counts as overdue."),
     "inactivity_days": ("Inactivity threshold (days)", int, 1, 180,
@@ -106,6 +135,8 @@ CREATE TABLE IF NOT EXISTS complaints (
     related_refs      TEXT NOT NULL DEFAULT '',
     reassign_count    INTEGER NOT NULL DEFAULT 0,
     is_synthetic      INTEGER NOT NULL DEFAULT 1,
+    submitted_by      TEXT NOT NULL DEFAULT '',
+    reopen_count      INTEGER NOT NULL DEFAULT 0,
     CHECK (due_date >= date_received)
 );
 CREATE TABLE IF NOT EXISTS complaint_notes (
@@ -142,13 +173,58 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     previous_value TEXT,
     new_value      TEXT,
     actor          TEXT NOT NULL,
-    details        TEXT
+    details        TEXT,
+    prev_hash      TEXT,
+    row_hash       TEXT
 );
 CREATE TABLE IF NOT EXISTS application_settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS users (
+    user_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    username            TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK (length(username) BETWEEN 3 AND 32),
+    email               TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    full_name           TEXT NOT NULL CHECK (length(trim(full_name)) > 1),
+    password_hash       TEXT NOT NULL,
+    role                TEXT NOT NULL CHECK (role IN ({_sql_list(ROLES)})),
+    bureau              TEXT CHECK (bureau IS NULL OR bureau IN ({_sql_list(BUREAUS)})),
+    email_verified      INTEGER NOT NULL DEFAULT 0,
+    verify_hash         TEXT,
+    verify_expires      TEXT,
+    verify_attempts     INTEGER NOT NULL DEFAULT 0,
+    is_active           INTEGER NOT NULL DEFAULT 1,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    failed_attempts     INTEGER NOT NULL DEFAULT 0,
+    locked_until        TEXT,
+    theme               TEXT NOT NULL DEFAULT 'light' CHECK (theme IN ('light','dark')),
+    created_at          TEXT NOT NULL,
+    last_login          TEXT,
+    CHECK (role <> 'Bureau Officer' OR bureau IS NOT NULL)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    last_seen  TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reopen_requests (
+    request_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    complaint_id   TEXT NOT NULL REFERENCES complaints(complaint_id),
+    requested_by   TEXT NOT NULL,
+    requested_by_id INTEGER,
+    reason         TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    status         TEXT NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending','Approved','Rejected')),
+    decided_by     TEXT,
+    decided_at     TEXT,
+    decision_note  TEXT,
+    created_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reopen_one_pending ON reopen_requests(complaint_id) WHERE status = 'Pending';
+CREATE INDEX IF NOT EXISTS idx_sessions_user       ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_complaints_inst     ON complaints(institution_id);
 CREATE INDEX IF NOT EXISTS idx_complaints_status   ON complaints(status);
 CREATE INDEX IF NOT EXISTS idx_complaints_bureau   ON complaints(bureau);
@@ -198,11 +274,17 @@ def _like(term: str) -> str:
     return f"%{t}%"
 
 
-@contextmanager
-def get_conn():
+def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 15000")
+    return conn
+
+
+@contextmanager
+def get_conn():
+    conn = _connect()
     try:
         yield conn
         conn.commit()
@@ -213,8 +295,79 @@ def get_conn():
         conn.close()
 
 
+# --------------------------------------------------------------------------- #
+# Current user context + role-based access control
+# --------------------------------------------------------------------------- #
+# The Streamlit layer sets the signed-in user at the start of every script run. Every data-layer function
+# below enforces permissions and bureau scope from this context, so a missing UI check cannot bypass RBAC.
+# With NO user set the caller is treated as trusted system code (seeding, tests, background jobs).
+_ctx = threading.local()
+
+
+def set_current_user(user: dict | None):
+    _ctx.user = user
+
+
+def current_user() -> dict | None:
+    return getattr(_ctx, "user", None)
+
+
+@contextmanager
+def trusted():
+    """Run system-level code (e.g. re-scoring suggestions over all bureaus) without the caller's scope."""
+    prev = current_user()
+    set_current_user(None)
+    try:
+        yield
+    finally:
+        set_current_user(prev)
+
+
+def user_label(user: dict | None = None) -> str:
+    u = user or current_user()
+    return f"{u['full_name']} ({u['role']})" if u else ""
+
+
+def has_perm(perm: str, user: dict | None = None) -> bool:
+    u = user if user is not None else current_user()
+    if u is None:
+        return True  # trusted system context
+    return u["role"] in PERMISSIONS[perm][0]
+
+
+def _guard(perm: str, bureau: str | None = None) -> str | None:
+    """Return an error message when the current user may not do this, else None."""
+    u = current_user()
+    if u is None:
+        return None
+    if u["role"] not in PERMISSIONS[perm][0]:
+        return f"Your role ({u['role']}) is not permitted to {PERMISSIONS[perm][1]}."
+    if bureau is not None and u["role"] == "Bureau Officer" and u.get("bureau") != bureau:
+        return f"This complaint belongs to the {bureau}. Bureau officers can only act on their own bureau's cases."
+    return None
+
+
+def _scope_bureaus(requested):
+    """Bureau officers only ever see their own bureau, whatever filters were requested."""
+    u = current_user()
+    if u and u["role"] == "Bureau Officer":
+        mine = u.get("bureau")
+        if requested:
+            return [b for b in requested if b == mine] or ["\x00none"]
+        return [mine]
+    return requested
+
+
+def _complaint_visible(conn, cid) -> bool:
+    u = current_user()
+    if not u or u["role"] != "Bureau Officer":
+        return True
+    r = conn.execute("SELECT bureau FROM complaints WHERE complaint_id=?", (cid,)).fetchone()
+    return bool(r) and r["bureau"] == u.get("bureau")
+
+
 def _read(sql: str, params=()) -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn = _connect()
     try:
         return pd.read_sql_query(sql, conn, params=list(params))
     finally:
@@ -237,18 +390,56 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
 # Audit + settings
 # --------------------------------------------------------------------------- #
 def _actor(conn) -> str:
+    u = current_user()
+    if u:
+        return user_label(u)
     row = conn.execute("SELECT value FROM application_settings WHERE key='demo_user'").fetchone()
     return row["value"] if row else "Demo Officer"
 
 
+_AUDIT_FIELDS = ("ts", "action_type", "entity_type", "entity_id", "previous_value", "new_value", "actor", "details")
+
+
+def _audit_hash(prev_hash: str, row: dict) -> str:
+    payload = json.dumps([prev_hash or ""] + [("" if row[k] is None else str(row[k])) for k in _AUDIT_FIELDS],
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def log_audit(conn, action, entity_type, entity_id, prev=None, new=None, details="",
               actor=None, ts=None):
+    """Append an audit event. Each event is hash-chained to the previous one (tamper evidence)."""
+    u = current_user()
+    who = user_label(u) if (u and not str(actor or "").startswith("System")) else (actor or _actor(conn))
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    last = conn.execute("SELECT row_hash FROM audit_logs WHERE row_hash IS NOT NULL "
+                        "ORDER BY event_id DESC LIMIT 1").fetchone()
+    prev_hash = last["row_hash"] if last else ""
+    row = dict(ts=ts or now_str(), action_type=action, entity_type=entity_type, entity_id=str(entity_id),
+               previous_value=None if prev is None else str(prev), new_value=None if new is None else str(new),
+               actor=who, details=details or "")
     conn.execute(
-        "INSERT INTO audit_logs(ts,action_type,entity_type,entity_id,previous_value,new_value,actor,details)"
-        " VALUES(?,?,?,?,?,?,?,?)",
-        (ts or now_str(), action, entity_type, str(entity_id),
-         None if prev is None else str(prev), None if new is None else str(new),
-         actor or _actor(conn), details or ""))
+        "INSERT INTO audit_logs(ts,action_type,entity_type,entity_id,previous_value,new_value,actor,details,"
+        "prev_hash,row_hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (row["ts"], action, entity_type, row["entity_id"], row["previous_value"], row["new_value"],
+         who, row["details"], prev_hash, _audit_hash(prev_hash, row)))
+
+
+def verify_audit_chain() -> dict:
+    """Recompute the hash chain. Rows written before hash-chaining existed (NULL hash) are skipped."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT event_id, " + ",".join(_AUDIT_FIELDS) + ", prev_hash, row_hash "
+                            "FROM audit_logs WHERE row_hash IS NOT NULL ORDER BY event_id").fetchall()
+        legacy = conn.execute("SELECT COUNT(*) FROM audit_logs WHERE row_hash IS NULL").fetchone()[0]
+    prev, bad = "", None
+    for r in rows:
+        d = dict(r)
+        if d["prev_hash"] != prev or _audit_hash(prev, d) != d["row_hash"]:
+            bad = d["event_id"]
+            break
+        prev = d["row_hash"]
+    return {"ok": bad is None, "checked": len(rows), "first_bad_event": bad, "legacy_unchained": legacy}
 
 
 def get_settings() -> dict:
@@ -260,6 +451,9 @@ def get_settings() -> dict:
 
 
 def default_actor() -> str:
+    """Audit label of whoever is acting: the signed-in user, else the configured demo label."""
+    if current_user():
+        return user_label()
     return get_settings().get("demo_user", "Demo Officer")
 
 
@@ -280,6 +474,9 @@ def _validate_setting(key, raw):
 
 
 def update_settings(new_values: dict, actor=None):
+    denied = _guard("settings.write")
+    if denied:
+        return False, denied
     current = get_settings()
     cleaned = {}
     for key, raw in new_values.items():
@@ -374,6 +571,9 @@ def _validate_institution(d, creating):
 
 
 def add_institution(d: dict, actor=None):
+    denied = _guard("institution.write")
+    if denied:
+        return False, denied
     errs, iid = _validate_institution(d, True)
     if errs:
         return False, " ".join(errs)
@@ -397,6 +597,9 @@ _INST_FIELDS = ("name", "state", "district", "institution_type", "approval_ref",
 
 
 def update_institution(iid: str, d: dict, actor=None):
+    denied = _guard("institution.write")
+    if denied:
+        return False, denied
     errs, _ = _validate_institution({**d, "institution_id": iid}, False)
     if errs:
         return False, " ".join(errs)
@@ -429,6 +632,7 @@ def enrich(df: pd.DataFrame, settings: dict | None = None, ref_date=None) -> pd.
     raw = (ref - df["due_date"]).dt.days.fillna(0).clip(lower=0).astype(int)
     df["days_overdue"] = raw.where(df["is_open"], 0)
     df["is_overdue"] = df["is_open"] & (df["days_overdue"] > int(s["overdue_grace_days"]))
+    df["days_to_due"] = (df["due_date"] - ref).dt.days.fillna(0).astype(int)
     df["days_inactive"] = (ref - df["last_updated"]).dt.days.fillna(0).astype(int)
     df["days_in_status"] = (ref - df["status_changed_at"]).dt.days.fillna(0).astype(int)
     df["resolution_days"] = (df["resolved_date"] - df["date_received"]).dt.days
@@ -449,7 +653,7 @@ def list_complaints(filters: dict | None = None) -> pd.DataFrame:
     for key, col in (("statuses", "c.status"), ("bureaus", "c.bureau"), ("categories", "c.category"),
                      ("priorities", "c.priority"), ("states", "i.state"),
                      ("institution_ids", "c.institution_id"), ("officers", "c.assigned_officer")):
-        vals = f.get(key)
+        vals = _scope_bureaus(f.get(key)) if key == "bureaus" else f.get(key)
         if vals:
             sql += f" AND {col} IN ({_Q(vals)})"
             params += list(vals)
@@ -469,18 +673,30 @@ def list_complaints(filters: dict | None = None) -> pd.DataFrame:
 
 def get_complaint(cid):
     with get_conn() as conn:
+        if not _complaint_visible(conn, cid):
+            return None
         r = conn.execute("SELECT c.*, i.name AS institution_name, i.state AS state FROM complaints c "
                          "JOIN institutions i ON i.institution_id=c.institution_id WHERE complaint_id=?",
                          (cid,)).fetchone()
         return dict(r) if r else None
 
 
+def _visible(cid) -> bool:
+    with get_conn() as conn:
+        return _complaint_visible(conn, cid)
+
+
 def list_notes(cid) -> pd.DataFrame:
+    if not _visible(cid):
+        return pd.DataFrame(columns=["note_id", "note_type", "note", "author", "created_at"])
     return _read("SELECT note_id, note_type, note, author, created_at FROM complaint_notes "
                  "WHERE complaint_id=? ORDER BY note_id DESC", [cid])
 
 
 def get_timeline(cid) -> pd.DataFrame:
+    if not _visible(cid):
+        return pd.DataFrame(columns=["event_id", "ts", "action_type", "entity_type", "entity_id",
+                                     "previous_value", "new_value", "actor", "details"])
     return _read("SELECT event_id, ts, action_type, entity_type, entity_id, previous_value, new_value, actor, details "
                  "FROM audit_logs WHERE (entity_type='Complaint' AND entity_id=?) "
                  "OR (entity_type='Relationship' AND (entity_id LIKE ? ESCAPE '\\' OR entity_id LIKE ? ESCAPE '\\')) "
@@ -542,6 +758,9 @@ def create_complaint(d: dict, actor=None):
     refs = [r for r in dict.fromkeys(_clean(x) for x in (d.get("related_refs") or [])) if r]
     if errs:
         return False, " ".join(errs), None
+    denied = _guard("complaint.create", _clean(d.get("bureau")))
+    if denied:
+        return False, denied, None
     try:
         with get_conn() as conn:
             if not conn.execute("SELECT 1 FROM institutions WHERE institution_id=?", (iid,)).fetchone():
@@ -554,10 +773,10 @@ def create_complaint(d: dict, actor=None):
             conn.execute(
                 "INSERT INTO complaints(complaint_id,institution_id,title,description,bureau,category,priority,"
                 "status,assigned_officer,date_received,last_updated,due_date,status_changed_at,resolved_date,"
-                "resolution_notes,related_refs,reassign_count,is_synthetic) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'',?,0,0)",
+                "resolution_notes,related_refs,reassign_count,is_synthetic,submitted_by,reopen_count) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,'',?,0,0,?,0)",
                 (cid, iid, title, desc, d["bureau"], d["category"], d["priority"], "Submitted", officer,
-                 str(received), day, str(due), day, ",".join(refs)))
+                 str(received), day, str(due), day, ",".join(refs), _actor(conn)))
             log_audit(conn, "COMPLAINT_CREATED", "Complaint", cid, None, "Submitted",
                       f"{title} | {d['bureau']} | {d['priority']} | officer {officer}", actor)
     except sqlite3.IntegrityError as e:
@@ -576,8 +795,15 @@ def update_status(cid, new_status, comment="", resolution_notes="", actor=None):
         c = _fetch(conn, cid)
         if not c:
             return False, "Complaint not found."
+        denied = _guard("complaint.update", c["bureau"]) or (
+            _guard("complaint.close") if new_status == "Closed" else None)
+        if denied:
+            return False, denied
         if c["status"] == new_status:
             return False, f"Complaint is already '{new_status}'."
+        if c["status"] in TERMINAL_STATUSES and new_status not in TERMINAL_STATUSES:
+            return False, ("A resolved or closed complaint cannot be moved back directly. "
+                           "Submit a reopen request so a senior officer can approve it.")
         res_new = _clean(resolution_notes)
         res_final = res_new or c["resolution_notes"]
         if new_status in TERMINAL_STATUSES and not res_final:
@@ -604,6 +830,9 @@ def change_priority(cid, new_priority, reason="", actor=None):
         c = _fetch(conn, cid)
         if not c:
             return False, "Complaint not found."
+        denied = _guard("complaint.priority", c["bureau"])
+        if denied:
+            return False, denied
         if c["priority"] == new_priority:
             return False, f"Priority is already {new_priority}."
         conn.execute("UPDATE complaints SET priority=?, last_updated=? WHERE complaint_id=?",
@@ -621,6 +850,9 @@ def assign_officer(cid, officer, reason="", actor=None):
         c = _fetch(conn, cid)
         if not c:
             return False, "Complaint not found."
+        denied = _guard("complaint.reassign", c["bureau"])
+        if denied:
+            return False, denied
         if c["assigned_officer"] == officer:
             return False, f"{officer} is already the assigned officer."
         conn.execute("UPDATE complaints SET assigned_officer=?, reassign_count=reassign_count+1, last_updated=? "
@@ -638,6 +870,9 @@ def update_due_date(cid, new_due, reason="", actor=None):
         c = _fetch(conn, cid)
         if not c:
             return False, "Complaint not found."
+        denied = _guard("complaint.due", c["bureau"])
+        if denied:
+            return False, denied
         if due < parse_date(c["date_received"]):
             return False, "Due date cannot be earlier than the date received."
         if str(due) == c["due_date"]:
@@ -656,8 +891,12 @@ def add_note(cid, text, note_type="Internal Note", actor=None):
     if len(text) > 3000:
         return False, "Note must be 3000 characters or fewer."
     with get_conn() as conn:
-        if not _fetch(conn, cid):
+        cc = _fetch(conn, cid)
+        if not cc:
             return False, "Complaint not found."
+        denied = _guard("complaint.update", cc["bureau"])
+        if denied:
+            return False, denied
         who = actor or _actor(conn)
         conn.execute("INSERT INTO complaint_notes(complaint_id,note_type,note,author,created_at) VALUES(?,?,?,?,?)",
                      (cid, note_type, text, who, now_str()))
@@ -676,6 +915,9 @@ def save_resolution_notes(cid, text, actor=None):
         c = _fetch(conn, cid)
         if not c:
             return False, "Complaint not found."
+        denied = _guard("complaint.update", c["bureau"])
+        if denied:
+            return False, denied
         if c["resolution_notes"] == text:
             return False, "Resolution notes are unchanged."
         conn.execute("UPDATE complaints SET resolution_notes=?, last_updated=? WHERE complaint_id=?",
@@ -695,6 +937,9 @@ def add_related_reference(cid, other, actor=None):
             return False, "Complaint not found."
         if not b:
             return False, f"Complaint {other} does not exist."
+        denied = _guard("complaint.update", a["bureau"])
+        if denied:
+            return False, denied
         for x, y in ((a, other), (b, cid)):
             refs = [r for r in x["related_refs"].split(",") if r]
             if y in refs:
@@ -706,6 +951,124 @@ def add_related_reference(cid, other, actor=None):
         log_audit(conn, "RELATED_REFERENCE_ADDED", "Complaint", cid, None, other,
                   "Manual reference recorded on both complaints", actor)
     return True, f"Reference to {other} added."
+
+
+# --------------------------------------------------------------------------- #
+# Reopen requests
+# --------------------------------------------------------------------------- #
+def request_reopen(cid, reason, actor=None):
+    """Any role may ask for a Resolved/Closed complaint to be reopened; a senior officer decides."""
+    reason = _clean(reason)
+    if not (10 <= len(reason) <= 1000):
+        return False, "Give a reason of 10-1000 characters explaining why the complaint should be reopened."
+    try:
+        with get_conn() as conn:
+            c = _fetch(conn, cid)
+            if not c:
+                return False, "Complaint not found."
+            denied = _guard("complaint.reopen_request", c["bureau"])
+            if denied:
+                return False, denied
+            if c["status"] not in TERMINAL_STATUSES:
+                return False, "Only Resolved or Closed complaints can be reopened."
+            u = current_user()
+            who = _actor(conn)
+            cur = conn.execute("INSERT INTO reopen_requests(complaint_id,requested_by,requested_by_id,reason,created_at)"
+                               " VALUES(?,?,?,?,?)", (cid, who, u["user_id"] if u else None, reason, now_str()))
+            log_audit(conn, "REOPEN_REQUESTED", "Complaint", cid, c["status"], "Reopen requested",
+                      f"Request #{cur.lastrowid}: {reason[:200]}", actor)
+    except sqlite3.IntegrityError:
+        return False, "A reopen request for this complaint is already waiting for a decision."
+    return True, "Reopen request submitted. A senior officer will review it."
+
+
+def list_reopen_requests(status=None, complaint_id=None) -> pd.DataFrame:
+    sql = ("SELECT r.request_id, r.complaint_id, c.title, c.bureau, c.priority, c.status AS complaint_status, "
+           "i.name AS institution_name, r.requested_by, r.reason, r.status, r.decided_by, r.decided_at, "
+           "r.decision_note, r.created_at, r.requested_by_id FROM reopen_requests r "
+           "JOIN complaints c ON c.complaint_id=r.complaint_id "
+           "JOIN institutions i ON i.institution_id=c.institution_id WHERE 1=1")
+    params = []
+    scoped = _scope_bureaus(None)
+    if scoped:
+        sql += f" AND c.bureau IN ({_Q(scoped)})"
+        params += list(scoped)
+    if status:
+        sql += f" AND r.status IN ({_Q(status if isinstance(status, (list, tuple)) else [status])})"
+        params += list(status if isinstance(status, (list, tuple)) else [status])
+    if complaint_id:
+        sql += " AND r.complaint_id=?"
+        params.append(complaint_id)
+    return _read(sql + " ORDER BY (r.status='Pending') DESC, r.request_id DESC", params)
+
+
+def _apply_reopen(conn, c, detail, actor):
+    day = str(today())
+    new_due = str(max(parse_date(c["due_date"]), today() + dt.timedelta(days=SLA_DAYS[c["priority"]])))
+    conn.execute("UPDATE complaints SET status='Under Review', resolved_date=NULL, status_changed_at=?, "
+                 "last_updated=?, reopen_count=reopen_count+1, due_date=? WHERE complaint_id=?",
+                 (day, day, new_due, c["complaint_id"]))
+    log_audit(conn, "STATUS_CHANGED", "Complaint", c["complaint_id"], c["status"], "Under Review", detail, actor)
+    if new_due != c["due_date"]:
+        log_audit(conn, "DUE_DATE_CHANGED", "Complaint", c["complaint_id"], c["due_date"], new_due,
+                  "Due date reset on reopen (priority SLA)", actor)
+
+
+def decide_reopen(request_id, approve: bool, note="", actor=None):
+    note = _clean(note)
+    denied = _guard("complaint.reopen_decide")
+    if denied:
+        return False, denied
+    if not approve and len(note) < 5:
+        return False, "Give a short reason (at least 5 characters) when rejecting a reopen request."
+    with get_conn() as conn:
+        r = conn.execute("SELECT * FROM reopen_requests WHERE request_id=?", (request_id,)).fetchone()
+        if not r:
+            return False, "Reopen request not found."
+        if r["status"] != "Pending":
+            return False, f"This request was already {r['status'].lower()}."
+        u = current_user()
+        if u and r["requested_by_id"] == u["user_id"]:
+            return False, "You cannot decide a reopen request that you raised yourself."
+        c = _fetch(conn, r["complaint_id"])
+        if approve and c["status"] not in TERMINAL_STATUSES:
+            return False, "The complaint is no longer Resolved or Closed."
+        who = _actor(conn)
+        verdict = "Approved" if approve else "Rejected"
+        conn.execute("UPDATE reopen_requests SET status=?, decided_by=?, decided_at=?, decision_note=? "
+                     "WHERE request_id=?", (verdict, who, now_str(), note, request_id))
+        log_audit(conn, "REOPEN_APPROVED" if approve else "REOPEN_REJECTED", "Complaint", r["complaint_id"],
+                  "Pending", verdict, f"Request #{request_id}: {note or 'no comment'}", actor)
+        if approve:
+            _apply_reopen(conn, c, f"Reopened via request #{request_id}", actor)
+    return True, (f"Request #{request_id} approved: {r['complaint_id']} is back Under Review."
+                  if approve else f"Request #{request_id} rejected.")
+
+
+def reopen_now(cid, reason, actor=None):
+    """Senior officers/admins may reopen directly; this is recorded as one explicit, audited event."""
+    reason = _clean(reason)
+    denied = _guard("complaint.reopen_decide")
+    if denied:
+        return False, denied
+    if not (10 <= len(reason) <= 1000):
+        return False, "Give a reason of 10-1000 characters."
+    with get_conn() as conn:
+        c = _fetch(conn, cid)
+        if not c:
+            return False, "Complaint not found."
+        if c["status"] not in TERMINAL_STATUSES:
+            return False, "Only Resolved or Closed complaints can be reopened."
+        if conn.execute("SELECT 1 FROM reopen_requests WHERE complaint_id=? AND status='Pending'", (cid,)).fetchone():
+            return False, "A reopen request is already pending; decide it instead."
+        who = _actor(conn)
+        u = current_user()
+        conn.execute("INSERT INTO reopen_requests(complaint_id,requested_by,requested_by_id,reason,status,decided_by,"
+                     "decided_at,decision_note,created_at) VALUES(?,?,?,?,'Approved',?,?,?,?)",
+                     (cid, who, u["user_id"] if u else None, reason, who, now_str(), "Direct reopen", now_str()))
+        log_audit(conn, "REOPEN_APPROVED", "Complaint", cid, c["status"], "Approved", f"Direct reopen: {reason[:200]}", actor)
+        _apply_reopen(conn, c, "Reopened directly by a senior officer", actor)
+    return True, f"{cid} reopened and set to Under Review."
 
 
 # --------------------------------------------------------------------------- #
@@ -751,6 +1114,10 @@ def list_relationships(confidences=None, review_statuses=None, active_only=False
     JOIN complaints a ON a.complaint_id=r.complaint_a JOIN complaints b ON b.complaint_id=r.complaint_b
     JOIN institutions i ON i.institution_id=r.institution_id WHERE 1=1"""
     params = []
+    scoped = _scope_bureaus(None)
+    if scoped:  # bureau officers see only pairs in which one of the complaints belongs to their bureau
+        sql += f" AND (a.bureau IN ({_Q(scoped)}) OR b.bureau IN ({_Q(scoped)}))"
+        params += list(scoped) + list(scoped)
     if confidences:
         sql += f" AND r.confidence IN ({_Q(confidences)})"
         params += list(confidences)
@@ -775,6 +1142,9 @@ def list_relationships(confidences=None, review_statuses=None, active_only=False
 
 
 def review_relationship(rid: int, decision: str, comment="", actor=None):
+    denied = _guard("relationship.review")
+    if denied:
+        return False, denied
     if decision not in ("Related", "Dismissed", "Pending"):
         return False, "Decision must be Related, Dismissed or Pending."
     with get_conn() as conn:
@@ -801,6 +1171,11 @@ def list_audit(date_from=None, date_to=None, action_types=None, entity_types=Non
     sql = ("SELECT event_id, ts, action_type, entity_type, entity_id, previous_value, new_value, actor, details "
            "FROM audit_logs WHERE 1=1")
     params = []
+    u = current_user()
+    if u and u["role"] == "Bureau Officer":  # own actions + events on own bureau's complaints only
+        sql += (" AND (actor=? OR (entity_type='Complaint' AND entity_id IN "
+                "(SELECT complaint_id FROM complaints WHERE bureau=?)))")
+        params += [user_label(u), u.get("bureau")]
     if date_from:
         sql += " AND ts >= ?"
         params.append(f"{date_from} 00:00:00")
@@ -831,16 +1206,38 @@ def table_counts() -> dict:
     with get_conn() as conn:
         return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in
                 ("institutions", "complaints", "complaint_notes", "complaint_relationships",
-                 "audit_logs", "application_settings")}
+                 "reopen_requests", "audit_logs", "users", "application_settings")}
 
 
 # --------------------------------------------------------------------------- #
 # Initialisation, seeding, reset
 # --------------------------------------------------------------------------- #
+def _add_column(conn, table, column, ddl):
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
+def _migrate(conn):
+    """Bring a database created by an older version up to the current schema without losing data."""
+    _add_column(conn, "complaints", "submitted_by", "submitted_by TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "complaints", "reopen_count", "reopen_count INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "audit_logs", "prev_hash", "prev_hash TEXT")
+    _add_column(conn, "audit_logs", "row_hash", "row_hash TEXT")
+
+
 def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = _connect()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")      # readers never block the writer; survives restarts
+        conn.execute("PRAGMA synchronous = NORMAL")
+    finally:
+        conn.close()
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+        conn.executescript(SCHEMA)  # indexes that depend on migrated columns
         for k, v in DEFAULT_SETTINGS.items():
             conn.execute("INSERT OR IGNORE INTO application_settings(key,value,updated_at) VALUES(?,?,?)",
                          (k, v, now_str()))
@@ -849,18 +1246,66 @@ def init_db():
 
 
 def reset_demo_data(confirm: bool = False, actor=None):
-    """Destroys all institutions/complaints/notes/relationships/audit history and reseeds. Needs confirm=True."""
+    """Destroys all institutions/complaints/notes/relationships/audit history and reseeds. Needs confirm=True.
+    User accounts and sessions are kept."""
+    denied = _guard("data.reset")
+    if denied:
+        return False, denied
     if confirm is not True:
         return False, "Reset not confirmed."
     with get_conn() as conn:
         who = actor or _actor(conn)
-        for t in ("complaint_relationships", "complaint_notes", "complaints", "institutions", "audit_logs"):
+        for t in ("reopen_requests", "complaint_relationships", "complaint_notes", "complaints",
+                  "institutions", "audit_logs"):
             conn.execute(f"DROP TABLE IF EXISTS {t}")
         conn.executescript(SCHEMA)
         seed_demo_data(conn)
         log_audit(conn, "DEMO_DATA_RESET", "System", "database", None, "reseeded",
                   "All data and audit history replaced with fresh synthetic demo data", who)
     return True, "Demo data was reset and re-seeded."
+
+
+# --------------------------------------------------------------------------- #
+# Backups
+# --------------------------------------------------------------------------- #
+BACKUP_DIR = os.environ.get("NEXUS_BACKUP_DIR") or os.path.join(os.path.dirname(DB_PATH), "backups")
+BACKUP_KEEP = 10
+
+
+def backup_database(actor=None):
+    """Consistent online copy using SQLite's backup API (safe while the app is running)."""
+    denied = _guard("backup.create")
+    if denied:
+        return False, denied
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"nexus_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+    src = _connect()
+    try:
+        out = sqlite3.connect(dest)
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+    finally:
+        src.close()
+    old = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("nexus_") and f.endswith(".db"))
+    for f in old[:-BACKUP_KEEP]:
+        os.remove(os.path.join(BACKUP_DIR, f))
+    with get_conn() as conn:
+        log_audit(conn, "BACKUP_CREATED", "System", "database", None, os.path.basename(dest),
+                  f"Online backup written ({os.path.getsize(dest) // 1024} KB); last {BACKUP_KEEP} kept", actor)
+    return True, f"Backup created: {os.path.basename(dest)}"
+
+
+def list_backups() -> list:
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    out = []
+    for f in sorted((f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")), reverse=True):
+        path = os.path.join(BACKUP_DIR, f)
+        out.append({"file": f, "size_kb": os.path.getsize(path) // 1024,
+                    "created": dt.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")})
+    return out
 
 
 _INSTITUTIONS = [
@@ -1046,7 +1491,8 @@ def seed_demo_data(conn):
         conn.execute(
             "INSERT INTO complaints(complaint_id,institution_id,title,description,bureau,category,priority,status,"
             "assigned_officer,date_received,last_updated,due_date,status_changed_at,resolved_date,resolution_notes,"
-            "related_refs,reassign_count,is_synthetic) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',?,1)",
+            "related_refs,reassign_count,is_synthetic,submitted_by,reopen_count) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'',?,1,'System (seed)',0)",
             (cid, r["institution_id"], r["title"], r["description"], r["bureau"], r["category"], r["priority"],
              r["status"], r["assigned_officer"], str(r["date_received"]), str(r["last_updated"]),
              str(r["due_date"]), str(r["status_changed_at"]),
@@ -1065,3 +1511,48 @@ def seed_demo_data(conn):
                                                    f"{r['status_changed_at']} 12:00:00"))
                 log_audit(conn, "NOTE_ADDED", "Complaint", cid, None, "Internal Note", note,
                           r["assigned_officer"], f"{r['status_changed_at']} 12:00:00")
+    _seed_reopen_requests(conn, rnd)
+    _seed_deadline_cases(conn)
+
+
+def _seed_reopen_requests(conn, rnd):
+    """A few reopen requests so the workflow can be shown in the demo (2 pending, 1 rejected, 1 approved)."""
+    done = [r["complaint_id"] for r in conn.execute(
+        "SELECT complaint_id FROM complaints WHERE status IN ('Resolved','Closed') ORDER BY complaint_id")]
+    active = [r["complaint_id"] for r in conn.execute(
+        "SELECT complaint_id FROM complaints WHERE status IN ('In Progress','Under Review') ORDER BY complaint_id")]
+    reasons = ["Institution has again stopped issuing fee receipts after the case was resolved.",
+               "Complainant submitted fresh evidence that the corrective action was not implemented.",
+               "Follow-up inspection found the reported deficiency still present.",
+               "Resolution was recorded before the institution submitted the promised documents."]
+    stamp = now_str()
+    plan = [(done[0], "Pending"), (done[1], "Pending"), (done[2], "Rejected")] if len(done) >= 3 else []
+    for n, (cid, status) in enumerate(plan):
+        conn.execute("INSERT INTO reopen_requests(complaint_id,requested_by,reason,status,decided_by,decided_at,"
+                     "decision_note,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                     (cid, "Priya Nair (Bureau Officer)", reasons[n], status,
+                      "Anita Deshmukh (Senior Officer)" if status != "Pending" else None,
+                      stamp if status != "Pending" else None,
+                      "Evidence already covered in the original resolution." if status != "Pending" else None, stamp))
+        log_audit(conn, "REOPEN_REQUESTED", "Complaint", cid, "Resolved", "Reopen requested", reasons[n],
+                  "System (seed)")
+    if active:
+        cid = active[0]
+        conn.execute("UPDATE complaints SET reopen_count=1 WHERE complaint_id=?", (cid,))
+        conn.execute("INSERT INTO reopen_requests(complaint_id,requested_by,reason,status,decided_by,decided_at,"
+                     "decision_note,created_at) VALUES(?,?,?,'Approved',?,?,?,?)",
+                     (cid, "Rohit Verma (Bureau Officer)", reasons[3], "Anita Deshmukh (Senior Officer)", stamp,
+                      "Approved after document review.", stamp))
+        log_audit(conn, "REOPEN_APPROVED", "Complaint", cid, "Pending", "Approved", "Seeded reopen history",
+                  "System (seed)")
+
+
+def _seed_deadline_cases(conn):
+    """Make a few open complaints due within the next days so deadline alerts are visible in the demo."""
+    t = today()
+    rows = conn.execute("SELECT complaint_id, date_received FROM complaints WHERE status IN ('Under Review','In Progress','Submitted') "
+                        "AND due_date >= ? ORDER BY complaint_id DESC LIMIT 12", (str(t),)).fetchall()
+    for k, r in zip((0, 1, 2, 3), rows):
+        due = t + dt.timedelta(days=k)
+        if due >= parse_date(r["date_received"]):
+            conn.execute("UPDATE complaints SET due_date=? WHERE complaint_id=?", (str(due), r["complaint_id"]))

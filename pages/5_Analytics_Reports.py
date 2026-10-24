@@ -3,15 +3,19 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+import auth
 import database as db
+import reports
 import ui
+
+user = auth.require()
 
 ui.page_header("Analytics & Reports", "Metrics, charts and CSV exports computed from the live database and your filters.")
 all_df = db.list_complaints()
 if all_df.empty:
     ui.empty_state("No complaints in the database yet.")
     st.stop()
-f = ui.global_filters("an", all_df, show_status=False, show_institution=False, show_priority=False)
+f = ui.global_filters("an", all_df)
 df = db.list_complaints(f)
 if df.empty:
     ui.empty_state("No complaints match the current filters.", "Widen the date range or clear the bureau/state filters.")
@@ -90,11 +94,22 @@ summary = pd.DataFrame([
     ("Date range", f"{f['date_from']} to {f['date_to']}"),
     ("Bureau filter", ", ".join(f["bureaus"]) or "All"), ("State filter", ", ".join(f.get("states", [])) or "All"),
     ("Generated on", db.now_str()), ("Data", "Synthetic demonstration data")], columns=["Metric", "Value"])
-cols = st.columns(5)
-cols[0].download_button("Complaints", db.to_csv_bytes(df.drop(columns=["is_open"])), "complaints.csv", "text/csv", key="an_x1")
-cols[1].download_button("Institutions", db.to_csv_bytes(inst_export), "institutions.csv", "text/csv", key="an_x2")
-cols[2].download_button("Overdue cases", db.to_csv_bytes(overdue_export), "overdue_cases.csv", "text/csv", key="an_x3")
-cols[3].download_button("Relationship suggestions", db.to_csv_bytes(rel_export), "relationship_suggestions.csv", "text/csv", key="an_x4")
-cols[4].download_button("Summary report", db.to_csv_bytes(summary), "summary_report.csv", "text/csv", key="an_x5")
+cols = st.columns(6)
+with cols[0]: ui.export_button("Complaints CSV", db.to_csv_bytes(df.drop(columns=["is_open"])), "complaints.csv", "text/csv", key="an_x1", what="Complaints (filtered)")
+with cols[1]: ui.export_button("Institutions CSV", db.to_csv_bytes(inst_export), "institutions.csv", "text/csv", key="an_x2", what="Institutions (filtered)")
+with cols[2]: ui.export_button("Overdue CSV", db.to_csv_bytes(overdue_export), "overdue_cases.csv", "text/csv", key="an_x3", what="Overdue cases")
+with cols[3]: ui.export_button("Suggestions CSV", db.to_csv_bytes(rel_export), "relationship_suggestions.csv", "text/csv", key="an_x4", what="Relationship suggestions")
+with cols[4]: ui.export_button("Summary CSV", db.to_csv_bytes(summary), "summary_report.csv", "text/csv", key="an_x5", what="Summary metrics")
+with cols[5]:
+    if reports.AVAILABLE:
+        kp = [("In scope", len(df)), ("Open", len(opn)), ("Avg resolution", f"{avg_res:.1f} d" if avg_res is not None else "n/a"),
+              ("On-time", f"{on_time:.0f}%" if on_time is not None else "n/a"),
+              ("Overdue share", f"{overdue_pct:.0f}%" if overdue_pct is not None else "n/a"), ("High-priority open", hp)]
+        ftxt = (f"{f['date_from']} to {f['date_to']}; bureaus: {', '.join(f['bureaus']) or ('own bureau' if user['role'] == 'Bureau Officer' else 'all')}; "
+                f"states: {', '.join(f.get('states', [])) or 'all'}")
+        ui.export_button("Summary PDF", reports.build_summary_pdf(df, kp, ftxt, user["full_name"], db.now_str()),
+                         "aicte_nexus_summary.pdf", "application/pdf", key="an_pdf", what="Summary PDF report")
+    else:
+        st.caption("PDF needs `pip install reportlab`.")
 with st.expander("Preview summary report"):
     ui.show_table(summary)

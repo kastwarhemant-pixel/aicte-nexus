@@ -1,15 +1,16 @@
-
+# Blue & White base theme (light). The Dark theme is applied by the in-app toggle (see ui.py).
 [theme]
-base = "dark"
-primaryColor = "#22D3EE"
-backgroundColor = "#0B1020"
-secondaryBackgroundColor = "#151F35"
-textColor = "#F8FAFC"
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#F3F7FF"
+secondaryBackgroundColor = "#E6EFFE"
+textColor = "#0E2748"
 font = "sans serif"
 
-[theme.sidebar]
-backgroundColor = "#0D1629"
-secondaryBackgroundColor = "#151F35"
+[server]
+headless = true
+enableXsrfProtection = true
+maxUploadSize = 5
 
 [browser]
 gatherUsageStats = false

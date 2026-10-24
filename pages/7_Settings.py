@@ -2,13 +2,16 @@
 import pandas as pd
 import streamlit as st
 
+import auth
 import database as db
 import intelligence as intel
 import ui
 
+user = auth.require("settings.write")
+
 ui.page_header("Settings", "Configurable demo thresholds, demo data reset, and production-readiness guidance.")
 s = db.get_settings()
-t1, t2, t3, t4 = st.tabs(["Thresholds", "Demo data", "Production readiness", "About this demo"])
+t1, t2, t3, t4 = st.tabs(["Thresholds", "Data & backups", "Production readiness", "About this demo"])
 
 with t1:
     st.caption("Changes are saved to the local database and recorded in the audit trail.")
@@ -52,14 +55,25 @@ with t2:
             st.session_state.pop(k, None)
         ui.result(ok, msg)
 
+with t2:
+    st.markdown("#### Database backups")
+    st.caption("Online, consistent copies (SQLite backup API). The last 10 are kept in the backups folder next to the database.")
+    if st.button("Create backup now", key="bk_now"):
+        ui.result(*db.backup_database(db.default_actor()))
+    bks = db.list_backups()
+    if bks:
+        ui.html_table(pd.DataFrame(bks), [("file", "File", "text"), ("created", "Created", "text"), ("size_kb", "Size (KB)", "text")])
+    else:
+        st.caption("No backups yet.")
+
 with t3:
     st.markdown("""
 This prototype is **not** production software. Before any real deployment the following are required:
 
 | Area | Needed for production |
 |---|---|
-| Authentication | Integration with the organisation's identity provider (SSO, multi-factor). The demo has **no login**; the "demo user" is only a label. |
-| Authorisation | Role-based and bureau-scoped access control, enforced on the server for every query and action. |
+| Authentication | The app has its own login (scrypt hashes, lockout, email verification, server-side sessions). Production should use the organisation's identity provider (SSO + multi-factor) and a real mail service. |
+| Authorisation | Admin / Senior / Bureau roles are enforced in the data layer. Production needs review against the organisation's actual access policy. |
 | Encryption | TLS in transit; encryption at rest for the database and backups; managed secrets. |
 | Data protection | Review of personal data in complaints, retention rules, and consent/legal basis. |
 | Backups and recovery | Automated backups, tested restores, and a managed database (not a local SQLite file). |
@@ -74,6 +88,6 @@ with t4:
 - **Synthetic data:** all institutions, complaints, officers and approval references are fictional demonstration records.
   Institution names are invented and do not represent real verified entities. No AICTE system is accessed.
 - **Database file:** `{db.DB_PATH}`
-- **Audit:** local and append-only through the app, not tamper-proof.
+- **Audit:** append-only and hash-chained (tamper-evident), but still a local file.
 - **Matching:** explainable heuristic prototype, offline, officer review required.
 """)

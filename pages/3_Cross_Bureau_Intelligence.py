@@ -1,20 +1,27 @@
 """Cross-Bureau Intelligence: explainable suggestions that an officer must review."""
 import streamlit as st
 
+import auth
 import database as db
 import intelligence as intel
 import ui
 
+user = auth.require()
+can_review = db.has_perm("relationship.review", user)
+
 ui.page_header("Cross-Bureau Intelligence",
                "Suggested links between complaints about the same institution handled by different bureaus.")
 ui.banner("<b>Explainable prototype, not a production-validated AI model.</b> Scores are heuristic similarity "
-          "indicators, not probabilities. Nothing is merged or closed automatically: an authorised officer must "
-          "confirm each relationship. Runs fully offline.", "warn")
+          "indicators, not probabilities. Nothing is merged or closed automatically: a Senior Officer or Admin must "
+          "verify each relationship (human verification). Runs fully offline.", "warn")
+if user["role"] == "Bureau Officer":
+    ui.banner(f"You see suggestions that involve at least one complaint of your bureau ({ui.e(user['bureau'])}). "
+              "Verification is done by Senior Officers.", "info")
 actor = db.default_actor()
 settings = db.get_settings()
 
 top = st.columns([1, 3])
-if top[0].button("Refresh suggestions", type="primary", key="ci_refresh"):
+if db.has_perm("relationship.refresh", user) and top[0].button("Refresh suggestions", type="primary", key="ci_refresh"):
     with st.spinner("Comparing complaints across bureaus…"):
         res = intel.refresh_suggestions(actor)
     ui.flash("success", f"Matching complete: {res['candidates']} candidate pair(s), {res['new']} new. "
@@ -93,6 +100,9 @@ with tab_cards:
                 if r.reviewed_by:
                     st.caption(f"Reviewed by {r.reviewed_by} on {r.reviewed_at}"
                                + (f" · comment: {r.review_comment}" if r.review_comment else ""))
+                if not can_review:
+                    st.caption("Only Senior Officers and Admins can verify suggestions.")
+                    continue
                 note = st.text_input("Reviewer comment (optional)", key=f"ci_cmt_{r.relationship_id}", max_chars=300)
                 b = st.columns(3)
                 if r.review_status != "Related" and b[0].button("Mark as Related", type="primary",
@@ -113,5 +123,5 @@ with tab_table:
             "confidence": "Confidence", "reasons": "Reasons", "review_status": "Review status",
             "reviewed_by": "Reviewed by", "reviewed_at": "Reviewed at"})
         ui.show_table(t)
-        st.download_button("Export suggestions to CSV", db.to_csv_bytes(t), "aicte_nexus_relationship_suggestions.csv",
-                           "text/csv", key="ci_export")
+        ui.export_button("Export suggestions to CSV", db.to_csv_bytes(t), "aicte_nexus_relationship_suggestions.csv",
+                         "text/csv", key="ci_export", what="Relationship suggestions")

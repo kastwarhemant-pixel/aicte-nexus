@@ -15,22 +15,60 @@ Legal). Each bureau sees only its own file, so related issues stay invisible and
 One dashboard where authorised officials can monitor and update complaints across bureaus, see everything about an
 institution in one place, get explainable suggestions about cases that may be related, and see every change recorded.
 
-## Features
+## What's new in this version (upgrade checklist 1–13)
+| # | Item | Where |
+|---|---|---|
+| 1 | Blue & White UI: deep-blue sidebar, bright-blue selected item, white cards, light-blue borders, filled KPI boxes, soft shadows | `ui.py` (CSS) |
+| 2 | Light / Dark toggle (sidebar and login page); cards, tables, charts, forms, tabs and dropdowns follow it; remembered per user | `ui.py` |
+| 3 | Premium intro (glowing logo, title reveal, loading bar), post-login "Welcome" transition, page fade-ins | `ui.py` |
+| 4 | Login, registration, email-verification code, scrypt password hashing, lockout, forced password change, server-side sessions with idle + absolute timeout | `accounts.py`, `auth.py` |
+| 5 | Roles: **Admin**, **Senior Officer**, **Bureau Officer** (bureau-scoped). Enforced in the data layer, not just the UI | `database.py` (`PERMISSIONS`) |
+| 6 | Unique complaint IDs, tracking page with progress stepper, officer assignment, resolution, **reopen requests** with approval | `pages/2_…` |
+| 7 | SQLite in WAL mode, schema migration for old databases, online backups, Docker + persistent volume | `database.py`, `Dockerfile`, `DEPLOY.md` |
+| 8 | Same-institution cross-bureau matching + "similar cases" lookup anywhere, similarity score, **human verification** by Senior/Admin | `intelligence.py` |
+| 9 | Overdue, Critical/High, **due-soon** deadline alerts (strip on pages, sidebar counts, login toast) | `intelligence.py` |
+| 10 | Analytics with all filters, trend charts, CSV exports **and PDF summary report** | `pages/5_…`, `reports.py` |
+| 11 | Audit trail: every user action, login/logout, exports, status history; **SHA-256 hash chain** with an integrity check | `database.py` |
+| 12 | NEXUS AI: complaint summaries, relevant similar cases, **privacy mode** (local by default; redaction before any external call) | `pages/8_…` |
+| 13 | 200+ automated checks, error-safe forms, responsive CSS, synthetic demo data with demo accounts, `DEMO_SCRIPT.md` | `tests/` |
+
+## Roles
+| Action | Admin | Senior Officer | Bureau Officer |
+|---|---|---|---|
+| See complaints | all | all | own bureau only |
+| Register / update status / notes | ✅ | ✅ | own bureau (up to *Resolved*) |
+| Close, reassign, change priority/due date | ✅ | ✅ | — |
+| Request reopen | ✅ | ✅ | ✅ |
+| Approve/reject reopen (not your own) | ✅ | ✅ | — |
+| Verify cross-bureau suggestions | ✅ | ✅ | view only |
+| Add/edit institutions | ✅ | ✅ | — |
+| Settings, backups, demo reset, user management | ✅ | — | — |
+
+## Demo accounts (when `NEXUS_DEMO_MODE=1`, the default)
+All use password `Nexus@2026`: `admin`, `senior.anita`, `approval.rohit`, `grievance.priya`, `regulation.imran`, `finance.suresh`, `quality.kavita`, `legal.manoj`.
+In demo mode the email-verification code is shown on screen; set `NEXUS_SMTP_*` to email it. Full list of settings: `.env.example`.
+
+## Modules
 | Module | What it does |
 |---|---|
-| Overview | Hero summary, 6 KPIs, status / priority / resolution / bureau / trend charts, critical, overdue, recent and activity lists. Filters: date, bureau, state, institution, status, priority. |
-| Institution Directory | Search (name/ID), state and type filters, details with full complaint history and charts, add (validated, duplicate IDs blocked), edit, CSV export. |
-| Complaint Management | Search + 7 filters, details view, timeline, create, status update, officer reassignment, priority change, due date change, notes, resolution notes, manual references, overdue highlighting, CSV export. |
-| Cross-Bureau Intelligence | Explainable pair suggestions with reasons, score, confidence label and review status. Officers mark **Related**, **Dismissed** or reset to pending. Nothing is merged or closed automatically. |
-| Risk Monitoring | Overdue / inactive / Critical / reassigned / awaiting-information flags with **recommended** next actions (never automatic). Thresholds configurable. |
-| Analytics & Reports | Counts by bureau, state, category, status, month, institution; avg resolution time, on-time %, overdue %; 5 CSV exports honouring filters. |
-| Audit Trail | Append-only event log with date / action / entity filters and CSV export. |
-| Settings | Thresholds, demo user label, demo-data reset (checkbox + typed `RESET`), production-readiness checklist. |
-| NEXUS AI Assistant | Database-grounded natural-language questions for complaint summary, overdue cases, bureau workload, institution volume, resolution performance and risk flags; result tables can be exported to CSV. Offline-safe intent mode works without an API key; optional Groq phrasing is available via `GROQ_API_KEY`. |
+| Command Center | Alert strip, hero summary, 6 KPIs, status / priority / resolution / bureau / trend charts, critical, overdue, recent and activity lists. |
+| Institution Directory | Search, details with full complaint history, add / edit (Senior+), CSV export. |
+| Complaint Management | Register with filters, details, timeline, notes, status, officer/priority/due date, resolution notes, references, **Reopen**, **Similar cases**, **Track a complaint**, **Reopen requests queue**. |
+| Cross-Bureau Intelligence | Explainable pair suggestions with reasons and score; Senior/Admin verify (Related / Dismissed). Nothing is merged or closed automatically. |
+| Risk Monitoring | Overdue / due-soon / inactive / Critical / reassigned / awaiting-information flags with recommended next actions. |
+| Analytics & Reports | Charts, KPIs, 5 CSV exports and a PDF summary honouring the filters. |
+| Audit Trail | Append-only, hash-chained log; integrity check; CSV export (exports are themselves logged). |
+| Settings (Admin) | Thresholds, backups, demo-data reset, production checklist. |
+| User Management (Admin) | Create users, change role/bureau, deactivate, unlock, issue temporary passwords. |
+| My Account | Profile, what your role may do, change password. |
+| NEXUS AI Assistant | Database-grounded answers, complaint summaries with similar cases, optional redacted Groq phrasing (opt-in). |
 
 ## Architecture
 ```
-app.py                 entry point: page config, theme, st.navigation
+app.py                 entry point: theme, intro, login gate, role-based st.navigation
+accounts.py            users, scrypt hashing, verification codes, sessions (no Streamlit)
+auth.py                login/registration screens, page guard, sidebar account
+reports.py             PDF report builder (ReportLab)
 ui.py                  CSS theme, badges, KPI cards, tables, filter bar
 database.py            SQLite schema, seeding, validated writes, audit logging, queries
 intelligence.py        TF-IDF matching (stdlib), risk rules
@@ -43,7 +81,7 @@ Navigation uses `st.navigation` so pages get clean titles (the Overview lives in
 
 ## Database structure (SQLite, `data/nexus.db`, created on first run)
 `institutions` · `complaints` · `complaint_notes` · `complaint_relationships` (unique ordered pair, review status) ·
-`audit_logs` (append-only via triggers) · `application_settings`. Primary and foreign keys, CHECK constraints, unique
+`users` · `sessions` · `reopen_requests` · `audit_logs` (append-only via triggers, hash-chained) · `application_settings`. Primary and foreign keys, CHECK constraints, unique
 constraints and indexes are defined in `database.py`; all SQL is parameterised.
 
 ## How cross-bureau matching works
@@ -86,26 +124,28 @@ including user-created records and audit history, and re-seeds. Normal startup n
 
 ## Tests
 ```bash
-python tests/test_backend.py      # 73 checks: database, validation, audit, matching, risk, CSV, persistence, reset
-python tests/ui_smoke_stub.py     # 37 checks: runs every page script against a STUB of Streamlit/Plotly
+python tests/test_backend.py        # 74 checks: database, validation, audit, matching, risk, CSV, persistence, reset
+python tests/test_security_rbac.py  # 61 checks: hashing, lockout, sessions, RBAC matrix, reopen, audit tamper detection, migration, injection
+python tests/ui_smoke_stub.py       # 67 checks: every page as Senior/Admin/Bureau officer against a STUB of Streamlit
 ```
 The stub test catches wiring and data errors but is **not** a browser test; verify visually with real Streamlit.
 
-## Limitations
-- No authentication or roles; the "demo user" is only an audit label.
-- Local SQLite file, single-user; audit log is not tamper-proof (anyone with file access can alter it).
-- Matching is a lightweight lexical heuristic: it can miss paraphrases and over-match shared boilerplate.
-- Seeded due dates, statuses and thresholds are illustrative. CSV exports neutralise spreadsheet formulas.
-- Visual layout has not been checked in a real browser in the build environment (see test notes).
+## Limitations (honest list)
+- The visual layer (light/dark CSS, animation) was written without a real browser in the build environment; the stub tests prove wiring, not looks. Check it once in Chrome and report any widget that looks off in Dark mode.
+- A browser refresh starts a new Streamlit session, so users sign in again.
+- SQLite, single server. Good for a demo/pilot; use PostgreSQL for many concurrent users.
+- Email needs SMTP; without it, demo mode shows the code on screen (never use that in production).
+- Matching is a lexical heuristic (can miss paraphrases); scores are not probabilities.
+- No compliance claims. See *Production security considerations*.
 
 ## Future improvements
-SSO and role-based, bureau-scoped access · managed database · hash-chained audit log · semantic embeddings
-validated on labelled cases · notifications and SLA escalation workflows · document attachments · API integration.
+SSO + MFA · PostgreSQL · persistent "remember me" cookies · email/SMS alert delivery · semantic embeddings validated on labelled cases · document attachments · API integration.
 
 ## Production security considerations
 Authentication (SSO + MFA), server-enforced authorisation, TLS and encryption at rest, secrets management, personal-data
 review and retention, automated backups and restores, centralised tamper-evident logging, threat modelling,
 dependency scanning and penetration testing, and a formal compliance review. **This prototype makes no compliance
 claims.** The same checklist appears in Settings → Production readiness.
-#   a i c t e - n e x u s  
+#   a i c t e - n e x u s 
+ 
  

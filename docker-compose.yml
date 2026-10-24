@@ -1,0 +1,9 @@
+services:
+  nexus:
+    build: .
+    ports: ["8501:8501"]
+    env_file: [.env]
+    volumes: ["nexus-data:/data"]     # database + backups survive restarts and redeploys
+    restart: unless-stopped
+volumes:
+  nexus-data:

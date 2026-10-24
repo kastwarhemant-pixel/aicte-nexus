@@ -108,23 +108,61 @@ def compute_candidates(df: pd.DataFrame, settings: dict) -> list:
 
 
 def refresh_suggestions(actor=None, log=True) -> dict:
-    """Recompute suggestions from the current database and store them. Never merges/closes anything."""
-    settings = db.get_settings()
-    cands = compute_candidates(db.list_complaints(), settings)
-    new = db.upsert_suggestions(cands)
-    if log:
-        with db.get_conn() as conn:
-            db.log_audit(conn, "SUGGESTIONS_REFRESHED", "Relationship", "all", None, len(cands),
-                         f"{new} new suggestion(s); reviewed decisions untouched", actor or "System")
+    """Recompute suggestions from the current database and store them. Never merges/closes anything.
+
+    Matching must see every bureau (that is the whole point), so it runs in trusted system scope even when a
+    bureau officer triggers it indirectly (e.g. by registering a complaint). Who may *press* Refresh is
+    enforced separately by the 'relationship.refresh' permission on the page.
+    """
+    with db.trusted():
+        settings = db.get_settings()
+        cands = compute_candidates(db.list_complaints(), settings)
+        new = db.upsert_suggestions(cands)
+        if log:
+            with db.get_conn() as conn:
+                db.log_audit(conn, "SUGGESTIONS_REFRESHED", "Relationship", "all", None, len(cands),
+                             f"{new} new suggestion(s); reviewed decisions untouched", actor or "System")
     return {"candidates": len(cands), "new": new}
+
+
+def similar_cases(cid: str, top: int = 5, min_cosine: float = 0.12) -> pd.DataFrame:
+    """Complaints textually similar to ``cid`` (any institution, any bureau), for the 'relevant case insights'
+    panel. Visible results respect the caller's bureau scope for the *source* complaint only; the similar cases
+    are returned with limited, non-sensitive fields."""
+    src = db.get_complaint(cid)
+    cols = ["complaint_id", "institution_name", "bureau", "title", "status", "priority", "similarity", "shared_terms",
+            "same_institution"]
+    if not src:
+        return pd.DataFrame(columns=cols)
+    with db.trusted():
+        df = db.list_complaints()
+    if df.empty or cid not in set(df["complaint_id"]):
+        return pd.DataFrame(columns=cols)
+    vecs, toks = build_vectors(df)
+    va, out = vecs[cid], []
+    inst = dict(zip(df["complaint_id"], df["institution_id"]))
+    for r in df.itertuples():
+        if r.complaint_id == cid:
+            continue
+        vb = vecs[r.complaint_id]
+        cos = sum(w * vb[t] for t, w in va.items() if t in vb)
+        if cos < min_cosine:
+            continue
+        shared = sorted((t for t in va if t in vb), key=lambda t: va[t] * vb[t], reverse=True)[:5]
+        out.append(dict(complaint_id=r.complaint_id, institution_name=r.institution_name, bureau=r.bureau,
+                        title=r.title, status=r.status, priority=r.priority, similarity=round(cos, 3),
+                        shared_terms=", ".join(shared), same_institution=inst[r.complaint_id] == inst[cid]))
+    return (pd.DataFrame(out, columns=cols).sort_values("similarity", ascending=False).head(top)
+            .reset_index(drop=True))
 
 
 # --------------------------------------------------------------------------- #
 # Overdue and risk monitoring
 # --------------------------------------------------------------------------- #
 RISK_COLUMNS = ["complaint_id", "institution_name", "bureau", "assigned_officer", "priority", "status",
-                "due_date", "days_overdue", "last_updated", "days_inactive", "risk_flags",
+                "due_date", "days_overdue", "days_to_due", "last_updated", "days_inactive", "risk_flags",
                 "recommended_action", "risk_score"]
+FLAG_COLUMNS = ["f_critical", "f_overdue", "f_due_soon", "f_inactive", "f_awaiting", "f_reassigned"]
 
 
 def compute_risk(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
@@ -134,13 +172,15 @@ def compute_risk(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
         return pd.DataFrame(columns=RISK_COLUMNS)
     inact, aw = int(settings["inactivity_days"]), int(settings["awaiting_info_days"])
     reas = int(settings["reassignment_threshold"])
+    soon = int(settings.get("due_soon_days", 3))
     act["f_critical"] = act["priority"] == "Critical"
     act["f_high_overdue"] = (act["priority"] == "High") & act["is_overdue"]
     act["f_overdue"] = act["is_overdue"]
+    act["f_due_soon"] = (~act["is_overdue"]) & (act["days_to_due"] >= 0) & (act["days_to_due"] <= soon)
     act["f_inactive"] = act["days_inactive"] >= inact
     act["f_awaiting"] = (act["status"] == "Awaiting Information") & (act["days_in_status"] >= aw)
     act["f_reassigned"] = act["reassign_count"] >= reas
-    act = act[act[["f_critical", "f_overdue", "f_inactive", "f_awaiting", "f_reassigned"]].any(axis=1)].copy()
+    act = act[act[FLAG_COLUMNS].any(axis=1)].copy()
     if act.empty:
         return pd.DataFrame(columns=RISK_COLUMNS)
 
@@ -148,6 +188,7 @@ def compute_risk(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
         out = []
         if r.f_critical: out.append("Critical priority")
         if r.f_overdue: out.append(f"Overdue {r.days_overdue}d")
+        if r.f_due_soon: out.append("Due today" if r.days_to_due == 0 else f"Due in {r.days_to_due}d")
         if r.f_inactive: out.append(f"Inactive {r.days_inactive}d")
         if r.f_awaiting: out.append(f"Awaiting info {r.days_in_status}d")
         if r.f_reassigned: out.append(f"Reassigned {r.reassign_count}x")
@@ -164,15 +205,52 @@ def compute_risk(df: pd.DataFrame, settings: dict) -> pd.DataFrame:
             return "Escalate to supervisor or record a justified revised due date"
         if r.f_inactive:
             return "Request a status update from the assigned officer"
+        if r.f_due_soon:
+            return "Deadline approaching: confirm the completion plan with the assigned officer"
         return "Review ownership; confirm a single accountable officer"
 
     def points(r):
         p = {"Critical": 3, "High": 2, "Medium": 1, "Low": 0}[r.priority]
         p += (2 + (1 if r.days_overdue > 30 else 0)) if r.f_overdue else 0
-        return p + int(r.f_inactive) + int(r.f_awaiting) + int(r.f_reassigned)
+        return p + int(r.f_inactive) + int(r.f_awaiting) + int(r.f_reassigned) + int(r.f_due_soon)
 
     act["risk_flags"] = act.apply(flags, axis=1)
     act["recommended_action"] = act.apply(action, axis=1)
     act["risk_score"] = act.apply(points, axis=1)
-    return act.sort_values(["risk_score", "days_overdue"], ascending=False)[RISK_COLUMNS + [
-        "f_critical", "f_overdue", "f_inactive", "f_awaiting", "f_reassigned"]].reset_index(drop=True)
+    return act.sort_values(["risk_score", "days_overdue"], ascending=False)[RISK_COLUMNS + FLAG_COLUMNS
+                                                                          ].reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
+# Alerts (deadline / overdue / high-priority), computed live from the database
+# --------------------------------------------------------------------------- #
+def compute_alerts(df: pd.DataFrame, settings: dict, officer_name: str | None = None) -> dict:
+    """Counts + the most urgent items for the alert strip. ``officer_name`` adds a 'my cases' breakdown."""
+    base = {"overdue": 0, "critical": 0, "due_soon": 0, "high_overdue": 0, "mine_overdue": 0, "mine_due_soon": 0,
+            "items": pd.DataFrame(columns=["complaint_id", "kind", "message", "priority", "assigned_officer"])}
+    if df is None or df.empty:
+        return base
+    risk = compute_risk(df, settings)
+    if risk.empty:
+        return base
+    base["overdue"] = int(risk["f_overdue"].sum())
+    base["critical"] = int(risk["f_critical"].sum())
+    base["due_soon"] = int(risk["f_due_soon"].sum())
+    base["high_overdue"] = int((risk["f_overdue"] & risk["priority"].isin(["Critical", "High"])).sum())
+    if officer_name:
+        mine = risk["assigned_officer"] == officer_name
+        base["mine_overdue"] = int((mine & risk["f_overdue"]).sum())
+        base["mine_due_soon"] = int((mine & risk["f_due_soon"]).sum())
+    rows = []
+    for r in risk.itertuples():
+        if r.f_overdue:
+            rows.append((r.complaint_id, "Overdue", f"{r.days_overdue} day(s) past due", r.priority, r.assigned_officer,
+                         0 if r.priority in ("Critical", "High") else 1, -int(r.days_overdue)))
+        elif r.f_due_soon:
+            rows.append((r.complaint_id, "Deadline", "due today" if r.days_to_due == 0 else f"due in {r.days_to_due} day(s)",
+                         r.priority, r.assigned_officer, 2, int(r.days_to_due)))
+        elif r.f_critical:
+            rows.append((r.complaint_id, "Critical", "open Critical complaint", r.priority, r.assigned_officer, 3, 0))
+    rows.sort(key=lambda x: (x[5], x[6]))
+    base["items"] = pd.DataFrame([x[:5] for x in rows], columns=base["items"].columns)
+    return base
